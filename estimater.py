@@ -13,10 +13,11 @@ import itertools
 from learning.training.predict_score import *
 from learning.training.predict_pose_refine import *
 import yaml
+import open3d as o3d
 
 
 class FoundationPose:
-  def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/bowen/debug/novel_pose_debug/'):
+  def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/bowen/debug/novel_pose_debug/', model_num = None):
     self.gt_pose = None
     self.ignore_normal_flip = True
     self.debug = debug
@@ -24,6 +25,10 @@ class FoundationPose:
     os.makedirs(debug_dir, exist_ok=True)
 
     self.reset_object(model_pts, model_normals, symmetry_tfs=symmetry_tfs, mesh=mesh)
+    # if model_num is None:
+      # self.reset_object(model_pts, model_normals, symmetry_tfs=symmetry_tfs, mesh=mesh)
+    # else:
+      # self.reset_object_grasp_model(model_pts, model_normals, symmetry_tfs=symmetry_tfs, mesh=mesh, model_num = model_num)
     self.make_rotation_grid(min_n_views=40, inplane_step=60)
 
     self.glctx = glctx
@@ -77,6 +82,47 @@ class FoundationPose:
 
     logging.info("reset done")
 
+  def reset_object_grasp_model(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, model_num=None):
+    from obj_params import configs as cfgs 
+
+    max_xyz = mesh.vertices.max(axis=0)
+    min_xyz = mesh.vertices.min(axis=0)
+    self.model_center = (min_xyz+max_xyz)/2
+    if mesh is not None:
+      self.mesh_ori = mesh.copy()
+      mesh = mesh.copy()
+      mesh.vertices = mesh.vertices - self.model_center.reshape(1,3)
+
+    model_pts = mesh.vertices
+    self.diameter = compute_mesh_diameter(model_pts=mesh.vertices, n_sample=10000)
+    # self.vox_size = max(self.diameter/20.0, 0.003)
+    
+    index_fill = (str(model_num-1).zfill(3))
+    sample_voxel_size, model_voxel_size, model_num_sample = cfgs[index_fill]
+    self.vox_size = sample_voxel_size
+    logging.info(f'self.diameter:{self.diameter}, vox_size:{self.vox_size}')
+    self.dist_bin = self.vox_size/2
+    self.angle_bin = 20  # Deg
+    pcd = toOpen3dCloud(model_pts, normals=model_normals)
+    pcd = pcd.voxel_down_sample(self.vox_size)
+    self.max_xyz = np.asarray(pcd.points).max(axis=0)
+    self.min_xyz = np.asarray(pcd.points).min(axis=0)
+    self.pts = torch.tensor(np.asarray(pcd.points), dtype=torch.float32, device='cuda')
+    self.normals = F.normalize(torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device='cuda'), dim=-1)
+    logging.info(f'self.pts:{self.pts.shape}')
+    self.mesh_path = None
+    self.mesh = mesh
+    if self.mesh is not None:
+      self.mesh_path = f'/tmp/{uuid.uuid4()}.obj'
+      self.mesh.export(self.mesh_path)
+    self.mesh_tensors = make_mesh_tensors(self.mesh)
+
+    if symmetry_tfs is None:
+      self.symmetry_tfs = torch.eye(4).float().cuda()[None]
+    else:
+      self.symmetry_tfs = torch.as_tensor(symmetry_tfs, device='cuda', dtype=torch.float)
+
+    logging.info("reset done")
 
 
   def get_tf_to_centered_mesh(self):
@@ -170,18 +216,29 @@ class FoundationPose:
       else:
         self.glctx = glctx
 
+    # depth = erode_depth(depth, radius=2, device='cuda')
+    # depth = bilateral_filter_depth(depth, radius=2, device='cuda')
+
     depth = erode_depth(depth, radius=2, device='cuda')
     depth = bilateral_filter_depth(depth, radius=2, device='cuda')
-
+                                   
+    
     if self.debug>=2:
       xyz_map = depth2xyzmap(depth, K)
       valid = xyz_map[...,2]>=0.001
       pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
+
+      o3d.visualization.draw_geometries([pcd])
       o3d.io.write_point_cloud(f'{self.debug_dir}/scene_raw.ply',pcd)
-      cv2.imwrite(f'{self.debug_dir}/ob_mask.png', (ob_mask*255.0).clip(0,255))
+    cv2.imwrite(f'{self.debug_dir}/ob_mask.png', (ob_mask*255.0).clip(0,255))
 
     normal_map = None
     valid = (depth>=0.001) & (ob_mask>0)
+    print("dd" ,np.unique(ob_mask))
+    print("obmask.sum", ob_mask.sum())
+    print("dd2",np.unique(depth>0.001))
+    print((depth>=0.001).sum())
+    print("valid.sum", valid.sum())
     if valid.sum()<4:
       logging.info(f'valid too small, return')
       pose = np.eye(4)
@@ -224,11 +281,11 @@ class FoundationPose:
     logging.info(f"final, add_errs min:{add_errs.min()}")
 
     ids = torch.as_tensor(scores).argsort(descending=True)
-    logging.info(f'sort ids:{ids}')
+    # logging.info(f'sort ids:{ids}')
     scores = scores[ids]
     poses = poses[ids]
 
-    logging.info(f'sorted scores:{scores}')
+    # logging.info(f'sorted scores:{scores}')
 
     best_pose = poses[0]@self.get_tf_to_centered_mesh()
     self.pose_last = poses[0]
@@ -266,5 +323,44 @@ class FoundationPose:
       extra['vis'] = vis
     self.pose_last = pose
     return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
+  
+
+  def add_err(self, pred,gt,model_pts,symetry_tfs=np.eye(4)[None]):
+    """
+    Average Distance of Model Points for objects with no indistinguishable views
+    - by Hinterstoisser et al. (ACCV 2012).
+    """
+    pred_pts = transform_pts(model_pts, pred)
+    gt_pts = transform_pts(model_pts, gt)
+    e = np.linalg.norm(pred_pts - gt_pts, axis=-1).mean()
+    return e
+  
+  def adds_err(self, pred,gt,model_pts):
+    """
+    @pred: 4x4 mat
+    @gt:
+    @model: (N,3)
+    """
+    pred_pts = transform_pts(model_pts, pred)
+    gt_pts = transform_pts(model_pts, gt)
+    nn_index = cKDTree(pred_pts)
+    nn_dists, _ = nn_index.query(gt_pts, k=1, workers=-1)
+    e = nn_dists.mean()
+    return e
+
+  def compute_auc_sklearn(self, errs, max_val=0.1, step=0.001):
+    from sklearn import metrics
+    errs = np.sort(np.array(errs))
+    X = np.arange(0, max_val+step, step)
+    Y = np.ones(len(X))
+    for i,x in enumerate(X):
+      y = (errs<=x).sum()/len(errs)
+      Y[i] = y
+      if y>=1:
+        break
+    auc = metrics.auc(X, Y) / (max_val*1)
+    return auc
+
+
 
 

@@ -19,7 +19,7 @@ if __name__=='__main__':
   parser.add_argument('--test_scene_dir', type=str, default=f'{code_dir}/demo_data/mustard0')
   parser.add_argument('--est_refine_iter', type=int, default=5)
   parser.add_argument('--track_refine_iter', type=int, default=2)
-  parser.add_argument('--debug', type=int, default=1)
+  parser.add_argument('--debug', type=int, default=2)
   parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug')
   args = parser.parse_args()
 
@@ -31,7 +31,7 @@ if __name__=='__main__':
   debug = args.debug
   debug_dir = args.debug_dir
   os.system(f'rm -rf {debug_dir}/* && mkdir -p {debug_dir}/track_vis {debug_dir}/ob_in_cam')
-
+ 
   to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
   bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
 
@@ -49,6 +49,15 @@ if __name__=='__main__':
     depth = reader.get_depth(i)
     if i==0:
       mask = reader.get_mask(0).astype(bool)
+      logging.info(f'mask:{mask.shape}')
+      logging.info(f'mask:{mask.dtype}')
+      # mask 시각화
+      plt.figure(figsize=(8, 8))
+      plt.imshow(mask, cmap='gray')  # True는 흰색, False는 검은색으로 표시됨
+      plt.title("Mask Visualization")
+      plt.axis('off')  # 축 숨기기
+      plt.show()
+      
       pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=mask, iteration=args.est_refine_iter)
 
       if debug>=3:

@@ -151,6 +151,7 @@ class PoseRefinePredictor:
     '''
     @rgb: np array (H,W,3)
     @ob_in_cams: np array (N,4,4)
+    @k: 카메라 내부 파라미터 행렬
     '''
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
     logging.info(f'ob_in_cams:{ob_in_cams.shape}')
@@ -166,7 +167,8 @@ class PoseRefinePredictor:
     logging.info(f"trans_normalizer:{self.cfg['trans_normalizer']}, rot_normalizer:{self.cfg['rot_normalizer']}")
     bs = 1024
 
-    B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float)
+    # 데이터 준비: GPU에서의 빠른 계산을 위해 입력 데이터를 변환
+    B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float) 
 
 
     if mesh_tensors is None:
@@ -179,16 +181,26 @@ class PoseRefinePredictor:
     if not isinstance(trans_normalizer, float):
       trans_normalizer = torch.as_tensor(list(trans_normalizer), device='cuda', dtype=torch.float).reshape(1,3)
 
-    for _ in range(iteration):
+    for _ in range(iteration): # 5
       logging.info("making cropped data")
+
+      # 배치 단위로 데이터 준비
       pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
+      
       B_in_cams = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
+        # A, B는 RGB 및 XYZ 맵 데이터를 결합한 입력
+        # A : 렌더링된 이미지(rgbAs)와 렌더링된 3D 좌표 맵(xyz_mapAs)을 결합한 데이터입니다.
+        #     렌더링 된 이미지란 3D 모델을 2D 이미지로 변환한 결과물을 의미, 3D 공간에 존재하는 물체나 장면을 카메라 시점에서 촬영한 것처럼 가상의 이미지를 생성하는 과정
+        # B : 원본 이미지(rgbBs)와 원본 3D 좌표 맵(xyz_mapBs)을 결합한 데이터입니다.
+        # rgbAs는 rgb_rs로 저장된 결과, 즉 렌더링된 이미지
+        # rgbBs는 원본 입력 RGB 이미지
         A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
         B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
+        
         logging.info("forward start")
         with torch.cuda.amp.autocast(enabled=self.amp):
-          output = self.model(A,B)
+          output = self.model(A,B) # 모델 예측
         for k in output:
           output[k] = output[k].float()
         logging.info("forward done")
@@ -228,7 +240,8 @@ class PoseRefinePredictor:
         if self.cfg['normalize_xyz']:
           trans_delta *= (mesh_diameter/2)
 
-        B_in_cam = egocentric_delta_pose_to_pose(pose_data.poseA[b:b+bs], trans_delta=trans_delta, rot_mat_delta=rot_mat_delta)
+        # 모델이 예측한 변화량(trans_delta, rot_mat_delta)을 기존 포즈에 적용하여 pose를 다시 계산 
+        B_in_cam = egocentric_delta_pose_to_pose(pose_data.poseA[b:b+bs], trans_delta=trans_delta, rot_mat_delta=rot_mat_delta) 
         B_in_cams.append(B_in_cam)
 
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
@@ -238,6 +251,7 @@ class PoseRefinePredictor:
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
 
+    # 시각화 부분
     if get_vis:
       logging.info("get_vis...")
       canvas = []
